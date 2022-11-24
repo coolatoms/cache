@@ -1,10 +1,11 @@
 package cache
 
 import (
+	pb "cache/cachepb"
 	"cache/consistenthash"
-	"errors"
 	"fmt"
-	"io"
+	"github.com/golang/protobuf/proto"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -40,7 +41,7 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Log("%s %s", r.Method, r.URL.Path)
 	// /<basepath>/<groupname>/<key> required
-	parts := strings.SplitN(r.URL.Path[len(p.basePath):], "/", 2) //从url获取groupname和key
+	parts := strings.SplitN(r.URL.Path[len(p.basePath):], "/", 2)
 	if len(parts) != 2 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -61,8 +62,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/octet-stream") //二进制流传输
-	w.Write(view.ByteSlice())
+	// Write the value to the response body as a proto message.
+	body, err := proto.Marshal(&pb.Response{Value: view.ByteSlice()})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(body)
 }
 
 type HttpGetter struct {
@@ -93,23 +101,33 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 
 var _ PeerPicker = (*HTTPPool)(nil)
 
-func (g HttpGetter) Get(group string, key string) ([]byte, error) {
-	u := fmt.Sprintf("%v%v/%v", g.baseURL, url.QueryEscape(group), url.QueryEscape(key))
-
+func (g HttpGetter) Get(in *pb.Request, out *pb.Response) error {
+	u := fmt.Sprintf(
+		"%v%v/%v",
+		g.baseURL,
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape(in.GetKey()),
+	)
 	res, err := http.Get(u)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.New("server return " + res.Status)
+		return fmt.Errorf("server returned: %v", res.Status)
 	}
-	bytes, err := io.ReadAll(res.Body)
+
+	bytes, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("reading response body: %v", err)
 	}
-	return bytes, nil
+
+	if err = proto.Unmarshal(bytes, out); err != nil {
+		return fmt.Errorf("decoding response body: %v", err)
+	}
+
+	return nil
 }
 
 var _ PeerGetter = (*HttpGetter)(nil)
